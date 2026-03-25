@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,6 +42,38 @@ var httpRequests = prometheus.NewCounterVec(
 )
 
 func init() { prometheus.MustRegister(httpRequests) }
+
+// readHostPID reads the host-namespace PID from /proc/self/status.
+// When running in a container with pid:host, os.Getpid() returns the
+// container PID (1), but BPF kprobes see the host PID. The NSpid line
+// in /proc/self/status contains both: "NSpid: <host_pid> <container_pid>".
+// The first value is always the host PID.
+func readHostPID() (uint32, error) {
+	f, err := os.Open("/proc/self/status")
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "NSpid:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			break
+		}
+		// fields[1] is the outermost (host) PID namespace PID
+		pid, err := strconv.ParseUint(fields[1], 10, 32)
+		if err != nil {
+			return 0, fmt.Errorf("parsing NSpid: %w", err)
+		}
+		return uint32(pid), nil
+	}
+	return 0, fmt.Errorf("NSpid not found in /proc/self/status")
+}
 
 func pushToLoki(lokiURL string, pid uint32, comm, method, path, status, protocol string) {
 	ts := time.Now().UnixNano()
@@ -79,6 +113,19 @@ func main() {
 		log.Fatalf("loading BPF objects: %v", err)
 	}
 	defer objs.Close()
+
+	// Write our host-namespace PID into the BPF self_pid map.
+	// os.Getpid() returns container PID (1), not the host PID that
+	// kprobes see. We read the real host PID from /proc/self/status.
+	hostPID, err := readHostPID()
+	if err != nil {
+		log.Fatalf("reading host pid: %v", err)
+	}
+	key := uint32(0)
+	if err := objs.SelfPid.Put(key, hostPID); err != nil {
+		log.Fatalf("writing self pid to BPF map: %v", err)
+	}
+	log.Printf("self-filtering host pid %d", hostPID)
 
 	// ---- HTTPS uprobes ----
 	ex, err := link.OpenExecutable(*libPath)

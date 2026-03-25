@@ -14,8 +14,16 @@ struct http_event {
     char  payload[MAX_PAYLOAD];
     __u32 len;
     __u8  is_response;
-    __u8  is_plain;      // 1 = plain HTTP, 0 = HTTPS
+    __u8  is_plain;
 };
+
+// Holds the monitor's own PID so we can self-filter
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} self_pid SEC(".maps");
 
 // Stash pointers on entry (shared by SSL_read and tcp_recvmsg)
 struct {
@@ -30,7 +38,15 @@ struct {
     __uint(max_entries, 1 << 24);
 } events SEC(".maps");
 
-// ---- HTTP method detection ----
+// ---- Helpers ----
+
+static __always_inline int is_self() {
+    __u32 key = 0;
+    __u32 *spid = bpf_map_lookup_elem(&self_pid, &key);
+    if (!spid) return 0;
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    return pid == *spid;
+}
 
 static __always_inline int is_http_request(const char *buf) {
     char b[8] = {};
@@ -55,10 +71,11 @@ static __always_inline int is_http_response(const char *buf) {
 
 SEC("uprobe/SSL_write")
 int probe_ssl_write(struct pt_regs *ctx) {
+    if (is_self()) return 0;
+
     struct http_event *e;
     const char *buf = (const char *)PT_REGS_PARM2(ctx);
     int num = (int)PT_REGS_PARM3(ctx);
-
     if (num <= 0) return 0;
 
     e = bpf_ringbuf_reserve(&events, sizeof(struct http_event), 0);
@@ -81,6 +98,7 @@ int probe_ssl_write(struct pt_regs *ctx) {
 
 SEC("uprobe/SSL_read")
 int probe_ssl_read_entry(struct pt_regs *ctx) {
+    if (is_self()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u64 buf = PT_REGS_PARM2(ctx);
     bpf_map_update_elem(&entry_args, &pid_tgid, &buf, BPF_ANY);
@@ -89,6 +107,7 @@ int probe_ssl_read_entry(struct pt_regs *ctx) {
 
 SEC("uretprobe/SSL_read")
 int probe_ssl_read_return(struct pt_regs *ctx) {
+    if (is_self()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u64 *bufp;
     struct http_event *e;
@@ -122,10 +141,12 @@ cleanup:
 
 SEC("kprobe/tcp_sendmsg")
 int probe_tcp_sendmsg(struct pt_regs *ctx) {
+    if (is_self()) return 0;
+
     struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    struct iov_iter iter = {};
     struct iovec iov = {};
     struct iovec *iov_ptr = NULL;
-    struct iov_iter iter = {};
 
     bpf_probe_read_kernel(&iter, sizeof(iter), &msg->msg_iter);
     bpf_probe_read_kernel(&iov_ptr, sizeof(iov_ptr), &iter.iov);
@@ -160,6 +181,7 @@ int probe_tcp_sendmsg(struct pt_regs *ctx) {
 
 SEC("kprobe/tcp_recvmsg")
 int probe_tcp_recvmsg(struct pt_regs *ctx) {
+    if (is_self()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u64 msg = (__u64)PT_REGS_PARM2(ctx);
     bpf_map_update_elem(&entry_args, &pid_tgid, &msg, BPF_ANY);
@@ -168,6 +190,7 @@ int probe_tcp_recvmsg(struct pt_regs *ctx) {
 
 SEC("kretprobe/tcp_recvmsg")
 int probe_tcp_recvmsg_return(struct pt_regs *ctx) {
+    if (is_self()) return 0;
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     int ret = (int)PT_REGS_RC(ctx);
     if (ret <= 0) goto cleanup;
