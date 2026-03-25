@@ -7,8 +7,6 @@ services:
     volumes:
       - /sys/kernel/btf:/sys/kernel/btf:ro
       - /sys/fs/bpf:/sys/fs/bpf
-      - /usr/lib:/usr/lib:ro
-      - /lib:/lib:ro
     command:
       - "-lib=/usr/lib/x86_64-linux-gnu/libssl.so.3"
       - "-metrics=:9091"
