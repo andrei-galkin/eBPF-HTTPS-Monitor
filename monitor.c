@@ -8,6 +8,13 @@
 
 #define MAX_PAYLOAD 256
 
+// __IOV_FIELD is set by the Dockerfile based on the kernel version:
+//   kernels < 6.0  → iov
+//   kernels >= 6.0 → __iov
+#ifndef __IOV_FIELD
+#define __IOV_FIELD __iov
+#endif
+
 struct http_event {
     __u32 pid;
     char  comm[16];
@@ -65,6 +72,25 @@ static __always_inline int is_http_response(const char *buf) {
     char b[5] = {};
     bpf_probe_read_user(b, sizeof(b), buf);
     return (b[0]=='H' && b[1]=='T' && b[2]=='T' && b[3]=='P');
+}
+
+// Read the first iovec base+len from a msghdr.
+// Uses __IOV_FIELD macro to handle both pre-6.0 (.iov) and 6.0+ (.__iov).
+#define _IOV_FIELD_PTR(iter) (&((iter).__IOV_FIELD))
+
+static __always_inline const char *msghdr_buf(struct msghdr *msg, __u32 *len_out) {
+    struct iov_iter iter = {};
+    bpf_probe_read_kernel(&iter, sizeof(iter), &msg->msg_iter);
+
+    const struct iovec *iov_ptr = NULL;
+    bpf_probe_read_kernel(&iov_ptr, sizeof(iov_ptr), _IOV_FIELD_PTR(iter));
+    if (!iov_ptr) return NULL;
+
+    struct iovec iov = {};
+    bpf_probe_read_kernel(&iov, sizeof(iov), iov_ptr);
+
+    if (len_out) *len_out = (__u32)iov.iov_len;
+    return (const char *)iov.iov_base;
 }
 
 // ---- HTTPS: SSL_write uprobe ----
@@ -144,17 +170,8 @@ int probe_tcp_sendmsg(struct pt_regs *ctx) {
     if (is_self()) return 0;
 
     struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
-    struct iov_iter iter = {};
-    struct iovec iov = {};
-    struct iovec *iov_ptr = NULL;
-
-    bpf_probe_read_kernel(&iter, sizeof(iter), &msg->msg_iter);
-    bpf_probe_read_kernel(&iov_ptr, sizeof(iov_ptr), &iter.iov);
-    if (!iov_ptr) return 0;
-    bpf_probe_read_kernel(&iov, sizeof(iov), iov_ptr);
-
-    const char *buf = iov.iov_base;
-    size_t count    = iov.iov_len;
+    __u32 count = 0;
+    const char *buf = msghdr_buf(msg, &count);
     if (!buf || count == 0) return 0;
 
     int req = is_http_request(buf);
@@ -169,7 +186,7 @@ int probe_tcp_sendmsg(struct pt_regs *ctx) {
     e->is_plain = 1;
     bpf_get_current_comm(&e->comm, sizeof(e->comm));
 
-    __u32 len = ((__u32)count) & (MAX_PAYLOAD - 1);
+    __u32 len = count & (MAX_PAYLOAD - 1);
     e->len = len;
     bpf_probe_read_user(&e->payload, len, buf);
 
@@ -199,16 +216,8 @@ int probe_tcp_recvmsg_return(struct pt_regs *ctx) {
     if (!msg_ptr) goto cleanup;
 
     struct msghdr *msg = (struct msghdr *)*msg_ptr;
-    struct iov_iter iter = {};
-    struct iovec iov = {};
-    struct iovec *iov_ptr = NULL;
-
-    bpf_probe_read_kernel(&iter, sizeof(iter), &msg->msg_iter);
-    bpf_probe_read_kernel(&iov_ptr, sizeof(iov_ptr), &iter.iov);
-    if (!iov_ptr) goto cleanup;
-    bpf_probe_read_kernel(&iov, sizeof(iov), iov_ptr);
-
-    const char *buf = iov.iov_base;
+    __u32 count = 0;
+    const char *buf = msghdr_buf(msg, &count);
     if (!buf) goto cleanup;
 
     int req = is_http_request(buf);

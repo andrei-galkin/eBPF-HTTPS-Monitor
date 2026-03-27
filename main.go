@@ -36,25 +36,43 @@ type HTTPEvent struct {
 	_          [2]byte // padding
 }
 
-var httpRequests = prometheus.NewCounterVec(
-	prometheus.CounterOpts{Name: "ebpf_http_requests_total"},
-	[]string{"pid", "comm", "method", "path", "protocol"},
+// filterList is a flag that accepts comma-separated values.
+type filterList []string
+
+func (f *filterList) String() string { return strings.Join(*f, ",") }
+func (f *filterList) Set(v string) error {
+	for _, s := range strings.Split(v, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			*f = append(*f, s)
+		}
+	}
+	return nil
+}
+
+var (
+	httpRequests = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "ebpf_http_requests_total"},
+		[]string{"pid", "comm", "method", "host", "path", "protocol"},
+	)
+	httpResponses = prometheus.NewCounterVec(
+		prometheus.CounterOpts{Name: "ebpf_http_responses_total"},
+		[]string{"pid", "comm", "status", "host", "protocol"},
+	)
 )
 
-func init() { prometheus.MustRegister(httpRequests) }
+func init() {
+	prometheus.MustRegister(httpRequests)
+	prometheus.MustRegister(httpResponses)
+}
 
-// readHostPID reads the host-namespace PID from /proc/self/status.
-// When running in a container with pid:host, os.Getpid() returns the
-// container PID (1), but BPF kprobes see the host PID. The NSpid line
-// in /proc/self/status contains both: "NSpid: <host_pid> <container_pid>".
-// The first value is always the host PID.
+// readHostPID reads the outermost PID from /proc/self/status (NSpid field).
 func readHostPID() (uint32, error) {
 	f, err := os.Open("/proc/self/status")
 	if err != nil {
 		return 0, err
 	}
 	defer f.Close()
-
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -65,7 +83,6 @@ func readHostPID() (uint32, error) {
 		if len(fields) < 2 {
 			break
 		}
-		// fields[1] is the outermost (host) PID namespace PID
 		pid, err := strconv.ParseUint(fields[1], 10, 32)
 		if err != nil {
 			return 0, fmt.Errorf("parsing NSpid: %w", err)
@@ -75,9 +92,60 @@ func readHostPID() (uint32, error) {
 	return 0, fmt.Errorf("NSpid not found in /proc/self/status")
 }
 
-func pushToLoki(lokiURL string, pid uint32, comm, method, path, status, protocol string) {
+// parseEvent extracts method, path, host and status from raw HTTP/1.x payload.
+// Returns empty strings if the payload is not HTTP/1.x (e.g. HTTP/2 binary frames).
+func parseEvent(payload string) (method, path, host, status string, ok bool) {
+	// Skip HTTP/2 connection preface — binary protocol, not parseable as HTTP/1.x
+	if strings.HasPrefix(payload, "PRI * HTTP/2") {
+		return "", "", "", "", false
+	}
+	// Skip HTTP/2 binary frames (start with a non-ASCII byte or known frame types)
+	if len(payload) > 0 && payload[0] < 0x20 && payload[0] != '\r' && payload[0] != '\n' {
+		return "", "", "", "", false
+	}
+
+	lines := strings.Split(payload, "\r\n")
+	if len(lines) == 0 {
+		return "", "", "", "", false
+	}
+
+	parts := strings.Fields(lines[0])
+
+	if len(parts) >= 3 && strings.HasPrefix(parts[2], "HTTP/1") {
+		// HTTP/1.x request: METHOD /path HTTP/1.x
+		method = parts[0]
+		path = parts[1]
+	} else if len(parts) >= 2 && strings.HasPrefix(parts[0], "HTTP/1") {
+		// HTTP/1.x response: HTTP/1.x STATUS reason
+		method = "RES"
+		status = parts[1]
+	} else {
+		return "", "", "", "", false
+	}
+
+	// Parse Host header
+	for _, line := range lines[1:] {
+		if line == "" {
+			break
+		}
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "host:") {
+			host = strings.TrimSpace(line[5:])
+		}
+	}
+
+	return method, path, host, status, true
+}
+
+func pushToLoki(lokiURL string, pid uint32, comm, method, host, path, status, protocol string) {
 	ts := time.Now().UnixNano()
-	line := fmt.Sprintf("method=%s path=%s status=%s protocol=%s", method, path, status, protocol)
+	var line string
+	if method == "RES" {
+		line = fmt.Sprintf("method=RES status=%s host=%s protocol=%s", status, host, protocol)
+	} else {
+		line = fmt.Sprintf("method=%s host=%s path=%s protocol=%s", method, host, path, protocol)
+	}
+
 	payload := map[string]interface{}{
 		"streams": []map[string]interface{}{{
 			"stream": map[string]string{
@@ -85,6 +153,7 @@ func pushToLoki(lokiURL string, pid uint32, comm, method, path, status, protocol
 				"pid":      fmt.Sprint(pid),
 				"comm":     comm,
 				"protocol": protocol,
+				"host":     host,
 			},
 			"values": [][]string{{fmt.Sprint(ts), line}},
 		}},
@@ -103,10 +172,23 @@ func pushToLoki(lokiURL string, pid uint32, comm, method, path, status, protocol
 }
 
 func main() {
-	libPath := flag.String("lib", "/usr/lib/x86_64-linux-gnu/libssl.so.3", "Path to libssl.so on the host")
-	metricsAddr := flag.String("metrics", ":9091", "Prometheus metrics address")
-	lokiURL := flag.String("loki", "http://127.0.0.1:3100/loki/api/v1/push", "Loki push URL")
+	libPath     := flag.String("lib",     "/lib/x86_64-linux-gnu/libssl.so.3", "Path to libssl.so on the host")
+	metricsAddr := flag.String("metrics", ":9091",                              "Prometheus metrics address")
+	lokiURL     := flag.String("loki",    "http://127.0.0.1:3100/loki/api/v1/push", "Loki push URL")
+	debug       := flag.Bool("debug",    false,                                 "Log raw payloads for debugging")
+
+	var excludeComms filterList
+	flag.Var(&excludeComms, "exclude", "Comma-separated comm names to exclude")
 	flag.Parse()
+
+	if len(excludeComms) == 0 {
+		excludeComms = filterList{"monitor", "loki", "prometheus", "grafana", "lifecycle-serve"}
+	}
+	excludeSet := make(map[string]struct{}, len(excludeComms))
+	for _, c := range excludeComms {
+		excludeSet[c] = struct{}{}
+	}
+	log.Printf("excluding comms: %v", excludeComms)
 
 	objs := bpfObjects{}
 	if err := loadBpfObjects(&objs, nil); err != nil {
@@ -114,9 +196,6 @@ func main() {
 	}
 	defer objs.Close()
 
-	// Write our host-namespace PID into the BPF self_pid map.
-	// os.Getpid() returns container PID (1), not the host PID that
-	// kprobes see. We read the real host PID from /proc/self/status.
 	hostPID, err := readHostPID()
 	if err != nil {
 		log.Fatalf("reading host pid: %v", err)
@@ -213,27 +292,43 @@ func main() {
 		}
 
 		comm := string(bytes.Trim(event.Comm[:], "\x00"))
+		if _, skip := excludeSet[comm]; skip {
+			continue
+		}
+
 		payload := string(event.Payload[:event.Len])
 		protocol := "HTTPS"
 		if event.IsPlain == 1 {
 			protocol = "HTTP"
 		}
 
-		lines := strings.Split(payload, "\r\n")
-		if len(lines) == 0 {
+		if *debug {
+			log.Printf("[DEBUG] %s pid=%d comm=%s payload=%q",
+				protocol, event.PID, comm, payload[:min(len(payload), 120)])
+		}
+
+		method, path, host, status, ok := parseEvent(payload)
+		if !ok {
 			continue
 		}
-		parts := strings.Fields(lines[0])
 
-		switch {
-		case event.IsResponse == 0 && len(parts) >= 3 && strings.HasPrefix(parts[2], "HTTP/"):
-			log.Printf("[%s] REQ %s %s (pid=%d comm=%s)", protocol, parts[0], parts[1], event.PID, comm)
-			httpRequests.WithLabelValues(fmt.Sprint(event.PID), comm, parts[0], parts[1], protocol).Inc()
-			pushToLoki(*lokiURL, event.PID, comm, parts[0], parts[1], "REQ", protocol)
-
-		case event.IsResponse == 1 && len(parts) >= 2 && strings.HasPrefix(parts[0], "HTTP/"):
-			log.Printf("[%s] RES %s (pid=%d comm=%s)", protocol, parts[1], event.PID, comm)
-			pushToLoki(*lokiURL, event.PID, comm, "RES", "-", parts[1], protocol)
+		switch method {
+		case "RES":
+			log.Printf("[%s] RES %s host=%s (pid=%d comm=%s)", protocol, status, host, event.PID, comm)
+			httpResponses.WithLabelValues(fmt.Sprint(event.PID), comm, status, host, protocol).Inc()
+			pushToLoki(*lokiURL, event.PID, comm, "RES", host, "-", status, protocol)
+		default:
+			fullURL := host + path
+			log.Printf("[%s] REQ %s %s (pid=%d comm=%s)", protocol, method, fullURL, event.PID, comm)
+			httpRequests.WithLabelValues(fmt.Sprint(event.PID), comm, method, host, path, protocol).Inc()
+			pushToLoki(*lokiURL, event.PID, comm, method, host, path, status, protocol)
 		}
 	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

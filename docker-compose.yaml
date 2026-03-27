@@ -7,10 +7,12 @@ services:
     volumes:
       - /sys/kernel/btf:/sys/kernel/btf:ro
       - /sys/fs/bpf:/sys/fs/bpf
+      - /lib/x86_64-linux-gnu/libssl.so.3:/lib/x86_64-linux-gnu/libssl.so.3:ro
     command:
-      - "-lib=/usr/lib/x86_64-linux-gnu/libssl.so.3"
+      - "-lib=/lib/x86_64-linux-gnu/libssl.so.3"
       - "-metrics=:9091"
       - "-loki=http://127.0.0.1:3100/loki/api/v1/push"
+      - "-exclude=monitor,loki,prometheus,grafana,lifecycle-serve"
     restart: always
     depends_on:
       - loki
