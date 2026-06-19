@@ -1,42 +1,25 @@
 FROM golang:1.24-bookworm AS builder
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    clang \
-    llvm \
-    libbpf-dev \
-    gcc-multilib \
-    linux-headers-amd64 \
-    linux-libc-dev \
-    bpftool \
-    git \
-    curl \
- && rm -rf /var/lib/apt/lists/*
+# Install LLVM/Clang toolchain
+RUN apt-get update && apt-get install -y clang llvm libbpf-dev gcc-multilib make
 
 WORKDIR /app
+
+# Install bpf2go tool
+RUN go install github.com/cilium/ebpf/cmd/bpf2go@latest
 
 COPY go.mod go.sum ./
 RUN go mod download
 
-RUN go install github.com/cilium/ebpf/cmd/bpf2go@v0.17.1
-
+# Copy your vmlinux.h, bpf/ folder, monitor.c, and main.go
 COPY . .
 
-RUN bpftool btf dump file /sys/kernel/btf/vmlinux format c > /app/vmlinux.h
-
-RUN GOPACKAGE=main bpf2go \
-    -target amd64 \
-    -cflags "-D__TARGET_ARCH_x86 -I/app" \
-    bpf /app/monitor.c
-
+# Generate BPF bytecode and build Go binary
+RUN go generate ./...
 RUN go build -o monitor .
 
+# Final runtime image
 FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 \
-    curl \
- && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /app/monitor /usr/local/bin/monitor
-
-ENTRYPOINT ["/usr/local/bin/monitor"]
+RUN apt-get update && apt-get install -y libssl3 curl && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /app/monitor /monitor
+ENTRYPOINT ["/monitor"]
